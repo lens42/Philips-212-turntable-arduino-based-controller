@@ -1,3 +1,4 @@
+#include "ArduPID.h"    // https://github.com/PowerBroker2/ArduPID
 #include <movingAvg.h>  // https://github.com/JChristensen/movingAvg
 
 /*
@@ -5,9 +6,9 @@
  */
 
 // Tach period target value for 33RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_33 = 20070;
+const int t_set_33 = 25000;
 // Tach period target value for 45RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_45 = 12700;
+const int t_set_45 = 12500;
 // Maps to PWM output to set gain. Lower number equals higher gain. Set while watching PWM output on oscilloscope. Set to highest values that does not result in oscillation pulse width.
 const int t_err_range = 11000;
 // Offset fine trim reading so center rotation = 0
@@ -21,7 +22,7 @@ const int photo_trip_min = 800;
  */
 
 // Debug flag
-const bool DEBUG = false;
+const bool DEBUG = true;
 // "OFF" LED drive output
 const byte LEDOFF = 6;
 // "33" LED drive output
@@ -99,6 +100,14 @@ long time45 = 0;
 // Last time we started v_photo readings
 long time_photo_start = 0;
 
+// PID
+ArduPID speedController;
+double pidSetpoint = 25000;
+double pidInput;
+double pidOutput;
+double pidP = 1000;
+double pidI = 0;
+double pidD = 0;
 
 void setup()
 {
@@ -117,8 +126,12 @@ void setup()
   // Set external interrupt for tachometer period measurement
   attachInterrupt(digitalPinToInterrupt(TACH_IN), tachometer, FALLING);
 
-  // Start with long period to ensure startup
-  t_per = 50000;
+  // Set up PID speed control
+  speedController.begin(&pidInput, &pidOutput, &pidSetpoint, pidP, pidI, pidD);
+  speedController.setOutputLimits(0, 255);
+
+//  // Start with long period to ensure startup
+//  t_per = 50000;
 
   // Initialise v_photo measurement moving average
   vPhotoAvg.begin();
@@ -134,29 +147,12 @@ void setup()
 void tachometer()
 {
   t_per = micros() - microseconds;
+  pidInput = t_per;
   microseconds = micros();
 }
 
-/* switch
-
-   Each time the input pin goes from LOW to HIGH (e.g. because of a push-button
-   press), the corrosponding output pin goes low and the other two go high.
-   Repeated button presses of the same button do nothing. A different button must be pressed to change state.
-   There's a minimum delay between toggles to debounce the circuit (i.e. to ignore
-   noise)
-
-   David A. Mellis with modifications by L. Sherman (2/2019) for interlock mechanism
-   21 November 2006
-*/
-
-void loop()
+void buttonsAndLeds()
 {
-  debug();
-
-  v_trim_45 = analogRead(TRIMPOT_45);
-  v_trim_33 = analogRead(TRIMPOT_33);
-  v_photo = analogRead(OPTO);
-
   /*
    * "OFF" button and LED
    */
@@ -165,6 +161,7 @@ void loop()
   // the time
   if (playState != off && digitalRead(BTNOFF) == LOW && millis() - timeOFF > debounce) {
     playState = off;
+    speedController.stop();
     timeOFF = millis();
   }
   digitalWrite(LEDOFF, playState == off ? LOW : HIGH);
@@ -177,6 +174,8 @@ void loop()
     time33 = millis();
   }
   if (playState == play33) {
+    pidSetpoint = t_set_33;
+    speedController.start();
     t_set = t_set_33 + v_trim_33 - trim_offset;
   }
   digitalWrite(LED33, playState == play33 ? LOW : HIGH);
@@ -189,10 +188,15 @@ void loop()
     time45 = millis();
   }
   if (playState == play45) {
+    pidSetpoint = t_set_45;
+    speedController.start();
     t_set = t_set_45 + v_trim_45 - trim_offset;
   }
   digitalWrite(LED45, playState == play45 ? LOW : HIGH);
+}
 
+void autoOff()
+{
   /*
    * Tonearm photo trip
    *
@@ -220,22 +224,54 @@ void loop()
       }
     }
   }
+}
 
-  /*
-   * Read period from tachometer
-   */
-  t_per = constrain(t_per, 5000, 50000);
-  t_diff = t_per - t_set;
-  n_PWM = map(t_diff, t_err_range, -t_err_range, 255, 0);
-  n_PWM = n_PWM - n_offset;
-  n_PWM = constrain(n_PWM, 0, 255);
+/* switch
+
+   Each time the input pin goes from LOW to HIGH (e.g. because of a push-button
+   press), the corrosponding output pin goes low and the other two go high.
+   Repeated button presses of the same button do nothing. A different button must be pressed to change state.
+   There's a minimum delay between toggles to debounce the circuit (i.e. to ignore
+   noise)
+
+   David A. Mellis with modifications by L. Sherman (2/2019) for interlock mechanism
+   21 November 2006
+*/
+
+void loop()
+{
+  debug();
+
+  v_trim_45 = analogRead(TRIMPOT_45);
+  v_trim_33 = analogRead(TRIMPOT_33);
+  v_photo = analogRead(OPTO);
+
+  buttonsAndLeds();
+
+  autoOff();
+
+  // PID speed control
+  speedController.compute();
+  speedController.debug(&Serial, "speedController", PRINT_INPUT    | // Can include or comment out any of these terms to print
+                                              PRINT_OUTPUT   | // in the Serial plotter
+                                              PRINT_SETPOINT);
+
+//  /*
+//   * Read period from tachometer
+//   */
+//  t_per = constrain(t_per, 5000, 50000);
+//  t_diff = t_per - t_set;
+//  n_PWM = map(t_diff, t_err_range, -t_err_range, 255, 0);
+//  n_PWM = n_PWM - n_offset;
+//  n_PWM = constrain(n_PWM, 0, 255);
 
   /*
    * Control motor
    *
    * Hold motor off during off state, else drive with PWM output
    */
-  analogWrite (PWM_OUT, playState == off ? 0 : n_PWM);
+//  analogWrite (PWM_OUT, playState == off ? 0 : n_PWM);
+  analogWrite(PWM_OUT, playState == off ? 0 : pidOutput);
 
 }
 
