@@ -8,9 +8,6 @@
 // Motor velocity target values for 33RPM and 45RPM. Set by trying values while measuring turntable with a separate tachometer
 const float t_set_33 = 3936;
 const int t_set_45 = 5318;
-// Pitch trim range (+ or -)
-const int trim_amount_33 = t_set_33 * 0.02;
-const int trim_amount_45 = t_set_45 * 0.02;
 // Whether to apply speed trimmer values
 const bool APPLY_TRIM = true;
 // Threshold for end-of-record auto-off photo sensor
@@ -51,6 +48,9 @@ const byte debounce = 10;
 const byte v_photo_avg_count = 20;
 // Threshold v_photo when the tonearm is in the exit groove
 const byte v_photo_threshold = 10;
+// Pitch trim range (+ or -) 2%
+const int trim_amount_33 = t_set_33 * 0.02;
+const int trim_amount_45 = t_set_45 * 0.02;
 
 
 /*
