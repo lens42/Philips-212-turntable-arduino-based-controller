@@ -1,4 +1,4 @@
-#include "ArduPID.h"    // https://github.com/PowerBroker2/ArduPID
+#include "QuickPID.h"   // https://github.com/Dlloydev/QuickPID
 #include <movingAvg.h>  // https://github.com/JChristensen/movingAvg
 
 /*
@@ -6,9 +6,11 @@
  */
 
 // Tach period target value for 33RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_33 = 25000;
+const int t_set_33 = 25410;
+const int t_set_33_nopid = 20070;
 // Tach period target value for 45RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_45 = 12500;
+const int t_set_45 = 18790;
+const int t_set_45_nopid = 12700;
 // Maps to PWM output to set gain. Lower number equals higher gain. Set while watching PWM output on oscilloscope. Set to highest values that does not result in oscillation pulse width.
 const int t_err_range = 11000;
 // Offset fine trim reading so center rotation = 0
@@ -101,13 +103,13 @@ long time45 = 0;
 long time_photo_start = 0;
 
 // PID
-ArduPID speedController;
-double pidSetpoint = 25000;
-double pidInput;
-double pidOutput;
-double pidP = 1000;
-double pidI = 0;
-double pidD = 0;
+const bool usePid = false;
+float pidSetpoint = 0;
+float pidInput;
+float pidOutput = 0;
+const float pidP = 0.014, pidI = 0.12, pidD = 0;
+//const float pidP = 0.014, pidI = 0.12, pidD = 0;
+QuickPID motorPid(&pidInput, &pidOutput, &pidSetpoint);
 
 void setup()
 {
@@ -127,11 +129,17 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(TACH_IN), tachometer, FALLING);
 
   // Set up PID speed control
-  speedController.begin(&pidInput, &pidOutput, &pidSetpoint, pidP, pidI, pidD);
-  speedController.setOutputLimits(0, 255);
+  if (usePid) {
+    motorPid.SetTunings(pidP, pidI, pidD);
+    motorPid.SetControllerDirection(motorPid.Action::reverse);
+    motorPid.SetOutputLimits(0, 250);
+    motorPid.SetAntiWindupMode(motorPid.iAwMode::iAwOff);
+    // Turn PID on
+    motorPid.SetMode(motorPid.Control::automatic);
+  }
 
-//  // Start with long period to ensure startup
-//  t_per = 50000;
+  // Start with long period to ensure startup
+  t_per = 50000;
 
   // Initialise v_photo measurement moving average
   vPhotoAvg.begin();
@@ -161,7 +169,9 @@ void buttonsAndLeds()
   // the time
   if (playState != off && digitalRead(BTNOFF) == LOW && millis() - timeOFF > debounce) {
     playState = off;
-    speedController.stop();
+    if (usePid) {
+      pidSetpoint = 0;
+    }
     timeOFF = millis();
   }
   digitalWrite(LEDOFF, playState == off ? LOW : HIGH);
@@ -172,11 +182,13 @@ void buttonsAndLeds()
   if (playState != play33 && digitalRead(BTN33) == LOW && millis() - time33 > debounce) {
     playState = play33;
     time33 = millis();
+    if (usePid) {
+      pidSetpoint = t_set_33;
+      pidInput = pidSetpoint * 1.5;
+    }
   }
   if (playState == play33) {
-    pidSetpoint = t_set_33;
-    speedController.start();
-    t_set = t_set_33 + v_trim_33 - trim_offset;
+    t_set = t_set_33_nopid + v_trim_33 - trim_offset;
   }
   digitalWrite(LED33, playState == play33 ? LOW : HIGH);
 
@@ -186,11 +198,13 @@ void buttonsAndLeds()
   if (playState != play45 && digitalRead(BTN45) == LOW && millis() - time45 > debounce) {
     playState = play45;
     time45 = millis();
+    if (usePid) {
+      pidSetpoint = t_set_45;
+      pidInput = pidSetpoint * 1.5;
+    }
   }
   if (playState == play45) {
-    pidSetpoint = t_set_45;
-    speedController.start();
-    t_set = t_set_45 + v_trim_45 - trim_offset;
+    t_set = t_set_45_nopid + v_trim_45 - trim_offset;
   }
   digitalWrite(LED45, playState == play45 ? LOW : HIGH);
 }
@@ -251,27 +265,29 @@ void loop()
   autoOff();
 
   // PID speed control
-  speedController.compute();
-  speedController.debug(&Serial, "speedController", PRINT_INPUT    | // Can include or comment out any of these terms to print
-                                              PRINT_OUTPUT   | // in the Serial plotter
-                                              PRINT_SETPOINT);
+  if (usePid && playState != off) {
+    motorPid.Compute();
+  }
 
-//  /*
-//   * Read period from tachometer
-//   */
-//  t_per = constrain(t_per, 5000, 50000);
-//  t_diff = t_per - t_set;
-//  n_PWM = map(t_diff, t_err_range, -t_err_range, 255, 0);
-//  n_PWM = n_PWM - n_offset;
-//  n_PWM = constrain(n_PWM, 0, 255);
+  /*
+   * Read period from tachometer
+   */
+  t_per = constrain(t_per, 5000, 50000);
+  t_diff = t_per - t_set;
+  n_PWM = map(t_diff, t_err_range, -t_err_range, 255, 0);
+  n_PWM = n_PWM - n_offset;
+  n_PWM = constrain(n_PWM, 0, 255);
 
   /*
    * Control motor
    *
    * Hold motor off during off state, else drive with PWM output
    */
-//  analogWrite (PWM_OUT, playState == off ? 0 : n_PWM);
-  analogWrite(PWM_OUT, playState == off ? 0 : pidOutput);
+  if (usePid) {
+    analogWrite(PWM_OUT, playState == off ? 0 : pidOutput);
+  } else {
+    analogWrite (PWM_OUT, playState == off ? 0 : n_PWM);
+  }
 
 }
 
@@ -280,27 +296,40 @@ void loop()
  */
 void debug()
 {
-  if (DEBUG) {
+  if (!DEBUG) {
+    return;
+  }
+  if (usePid) {
+    Serial.print("pidInput:");
+    Serial.print(pidInput);
+    Serial.print(",");
+    Serial.print("pidOutput:");
+    Serial.print(pidOutput);
+    Serial.print(",");
+    Serial.print("pidSetpoint:");
+    Serial.print(pidSetpoint);
+    Serial.println();
+  } else {
     Serial.print(t_per);
     Serial.print(" ");
     Serial.print(t_diff);
     Serial.print(" ");
-    Serial.print(v_trim_33);
-    Serial.print(" ");
-    Serial.print(v_trim_45);
-    Serial.print (" ");
+//    Serial.print(v_trim_33);
+//    Serial.print(" ");
+//    Serial.print(v_trim_45);
+//    Serial.print (" ");
     Serial.print (t_set);
     Serial.print (" ");
     Serial.print (n_PWM);
-    Serial.print (" ");
-    Serial.print (v_photo);
-    Serial.print (" ");
-    Serial.print (playState);
-    Serial.print (" ");
-    if (vPhotoAvg.getAvg() - previous_v_photo_avg > 0) {
-      Serial.print (vPhotoAvg.getAvg() - previous_v_photo_avg);
-      Serial.print (" ");
-    }
+//    Serial.print (" ");
+//    Serial.print (v_photo);
+//    Serial.print (" ");
+//    Serial.print (playState);
+//    Serial.print (" ");
+//    if (vPhotoAvg.getAvg() - previous_v_photo_avg > 0) {
+//      Serial.print (vPhotoAvg.getAvg() - previous_v_photo_avg);
+//      Serial.print (" ");
+//    }
     Serial.println();
   }
 }
