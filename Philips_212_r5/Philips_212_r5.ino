@@ -8,13 +8,11 @@
 // Motor velocity target values for 33RPM and 45RPM. Set by trying values while measuring turntable with a separate tachometer
 const float t_set_33 = 3936;
 const int t_set_45 = 5318;
-// Min and max values for the 33RPM and 45RPM trim dials. Measure and set...
-const int trim_33_min = 1023;
-const int trim_33_max = 9;
-const int trim_33_mid = abs(trim_33_min - trim_33_max) / 2;
-const int trim_45_min = 1023;
-const int trim_45_max = 0;
-const int trim_45_mid = abs(trim_45_min - trim_45_max) / 2;
+// Pitch trim range (+ or -)
+const int trim_amount_33 = t_set_33 * 0.02;
+const int trim_amount_45 = t_set_45 * 0.02;
+// Whether to apply speed trimmer values
+const bool APPLY_TRIM = true;
 // Threshold for end-of-record auto-off photo sensor
 const int photo_trip_min = 800;
 
@@ -24,7 +22,7 @@ const int photo_trip_min = 800;
  */
 
 // Debug flag
-const bool DEBUG = true;
+const bool DEBUG = false;
 // "OFF" LED drive output
 const byte LEDOFF = 6;
 // "33" LED drive output
@@ -175,6 +173,9 @@ void buttonsAndLeds()
     pidSetpoint = t_set_33;
     pidInput = pidSetpoint * 1.5;
     playState = play33;
+  } else if (playState == play33 && APPLY_TRIM) {
+    float adjust33 = map(v_trim_33, 1023, 0, -100, 100);
+    pidSetpoint = t_set_33 + (trim_amount_33 * (adjust33 / 100));
   }
   digitalWrite(LED33, playState == play33 ? LOW : HIGH);
 
@@ -189,6 +190,9 @@ void buttonsAndLeds()
     pidSetpoint = t_set_45;
     pidInput = pidSetpoint * 1.5;
     playState = play45;
+  } else if (playState == play45 && APPLY_TRIM) {
+    float adjust45 = map(v_trim_45, 1023, 0, -100, 100);
+    pidSetpoint = t_set_45 + (trim_amount_45 * (adjust45 / 100));
   }
   digitalWrite(LED45, playState == play45 ? LOW : HIGH);
 }
@@ -243,8 +247,10 @@ void loop()
   pidInput = velocity_i;
   interrupts(); // turn interrupts back on
 
-  v_trim_45 = analogRead(TRIMPOT_45);
-  v_trim_33 = analogRead(TRIMPOT_33);
+  if (APPLY_TRIM) {
+    v_trim_45 = analogRead(TRIMPOT_45);
+    v_trim_33 = analogRead(TRIMPOT_33);
+  }
   v_photo = analogRead(OPTO);
   
   debug();
@@ -282,12 +288,6 @@ void debug()
   if (!DEBUG) {
     return;
   }
-  Serial.print("v_trim_33:");
-  Serial.print(v_trim_33);
-  Serial.print(",");
-  Serial.print("v_trim_45:");
-  Serial.print(v_trim_45);
-  Serial.print(",");
   Serial.print("pidInput:");
   Serial.print(pidInput);
   Serial.print(",");
