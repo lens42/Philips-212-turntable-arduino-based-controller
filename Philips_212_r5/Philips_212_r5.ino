@@ -1,58 +1,52 @@
+#include "QuickPID.h"   // https://github.com/Dlloydev/QuickPID
 #include <movingAvg.h>  // https://github.com/JChristensen/movingAvg
 
 /*
  * Constants specific to each GA-212 turntable
  */
 
-// Tach period target value for 33RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_33 = 20070;
-// Tach period target value for 45RPM. Set by trying values while measuring turntable with a separate tachometer
-const int t_set_45 = 12700;
-// Maps to PWM output to set gain. Lower number equals higher gain. Set while watching PWM output on oscilloscope. Set to highest values that does not result in oscillation pulse width.
-const int t_err_range = 11000;
-// Offset fine trim reading so center rotation = 0
-const int trim_offset = 512;
-// Threshold for end-of-record auto-off photo sensor
-const int photo_trip_min = 800;
-
+// Factor that turns velocity into a number that looks like RPMs. Set by trying values while measuring turntable with a separate tachometer.
+const float VEL_FACTOR = 0.846798789;
+// Threshold for end-of-record auto-off photo sensor. This probably doesn't need to be adjusted...
+const int PHOTO_MIN_VALUE = 800;
 
 /*
  * Constants
  */
 
+// Motor velocity target values for 33RPM and 45RPM
+const float TARGET_VEL_33 = 33.33 * 100;
+const float TARGET_VEL_45 = 45 * 100;
 // Debug flag
 const bool DEBUG = false;
-// "OFF" LED drive output
+// Whether to apply speed trimmer values
+const bool APPLY_TRIM = true;
+// LED pins
 const byte LEDOFF = 6;
-// "33" LED drive output
 const byte LED33 = 5;
-// "45" LED drive output
 const byte LED45 = 7;
-// "OFF" touch button input
+// Button pins
 const byte BTNOFF = 9;
-// "33" touch button input
 const byte BTN33 = 8;
-// "45" touch button input
 const byte BTN45 = 10;
-// Analog input from trim pot to fine tune 33 RPM
+// 33 & 45 RPM speed trimmer pin
 const byte TRIMPOT_33 = A0;
-// Analog inpit from trim pot to fine tune 45 RPM
 const byte TRIMPOT_45 = A1;
-// Analog input from auto off photo resistor
+// Auto off photo resistor pin
 const byte OPTO = A2;
-// Input pin for tach output from motor
+// Motor tachometer pin
 const byte TACH_IN = 2;
-// PWM drive output to motor
+// PWM motor drive pin
 const byte PWM_OUT = 11;
-// PWM output that drives motor at 33.3 RPM. Measured to get approximately correct output when t_diff is 0
-const int n_offset = 127 - 43;
-// Debounce time (ms) can be short because OFF, 33, and 45 states latch until a different button is pressed
-const byte debounce = 10;
-// Number of v_photo measurements to average
-const byte v_photo_avg_count = 20;
-// Threshold v_photo when the tonearm is in the exit groove
-const byte v_photo_threshold = 10;
-
+// DEBOUNCE_MS time (ms) can be short because OFF, 33, and 45 states latch until a different button is pressed
+const byte DEBOUNCE_MS = 10;
+// Number of photo measurements to average
+const byte PHOTO_MEASUREMENT_COUNT = 20;
+// Amount that valuePhoto needs to change between two measurements, in order to trigger auto-off
+const byte PHOTO_CHANGE_THRESHOLD = 10;
+// Pitch trim range (+ or -) 2%
+const int TRIM_AMOUNT_33 = TARGET_VEL_33 * 0.02;
+const int TRIM_AMOUNT_45 = TARGET_VEL_45 * 0.02;
 
 /*
  * Variables
@@ -66,39 +60,43 @@ enum playStateValue {
 };
 playStateValue playState = off;
 // 45 RPM fine trim pot value
-int v_trim_45;
+int valueTrim45;
 // 33 RPM fine trim pot value
-int v_trim_33;
+int valueTrim33;
 // Auto-off photo sensor value
-int v_photo = 0;
+int valuePhoto = 0;
 // Flag to remember whether we're measuring the auto-off photo resistor
-bool photo_measuring = false;
-// Moving average of the v_photo measurement
-movingAvg vPhotoAvg(v_photo_avg_count);
-// Previous v_photo average
-int previous_v_photo_avg = 0;
-
-// Difference between set and target period
-int t_diff;
-// Tach period target value for the currently active RPM
-int t_set;
-// PWM motor drive
-int n_PWM;
-volatile unsigned long t_per;
-unsigned long microseconds;
+bool photoMeasurementIsActive = false;
+// Moving average of the valuePhoto measurement
+movingAvg valuePhotoAvg(PHOTO_MEASUREMENT_COUNT);
+// Previous valuePhoto average
+int previousValuePhotoAvg = 0;
 
 // The following variables are longs because the time, measured in miliseconds,
 // will quickly become a bigger number than can be stored in an int.
 
 // Last time OFF button changed state
-long timeOFF = 0;
+long lastTimeOff = 0;
 // Last time 33 button changed state
-long time33 = 0;
+long lastTime33 = 0;
 // Last time 45 button changed state
-long time45 = 0;
-// Last time we started v_photo readings
-long time_photo_start = 0;
+long lastTime45 = 0;
+// Last time 33 or 45 button changed state
+long lastTimePlay = 0;
+// Last time we started valuePhoto readings
+long timePhotoMeasureStart = 0;
 
+// PID
+float pidSetpoint = 0, pidInput, pidOutput = 0;
+const float pidP = 0.135, pidI = 0.6, pidD = 0;
+QuickPID motorPid(&pidInput, &pidOutput, &pidSetpoint);
+// Smooth out velocity readings to avoid judder (some loop cycles there is no new reading from the tachometer)
+movingAvg velocityAvg(3);
+
+// Use the "volatile" directive for variables
+// used in an interrupt
+volatile float tachPeriodInterrupt = 0;
+volatile unsigned long prevTimeInterrupt = 0;
 
 void setup()
 {
@@ -115,13 +113,18 @@ void setup()
   pinMode(PWM_OUT, OUTPUT);
 
   // Set external interrupt for tachometer period measurement
-  attachInterrupt(digitalPinToInterrupt(TACH_IN), tachometer, FALLING);
+  attachInterrupt(digitalPinToInterrupt(TACH_IN), interruptReadTachometer, FALLING);
 
-  // Start with long period to ensure startup
-  t_per = 50000;
+  // Set up PID speed control
+  motorPid.SetTunings(pidP, pidI, pidD);
+  motorPid.SetOutputLimits(0, 255);
+  motorPid.SetAntiWindupMode(motorPid.iAwMode::iAwOff);
+  // Turn PID on
+  motorPid.SetMode(motorPid.Control::automatic);
 
-  // Initialise v_photo measurement moving average
-  vPhotoAvg.begin();
+  // Initialise moving averages
+  valuePhotoAvg.begin();
+  velocityAvg.begin();
 
   if (DEBUG) {
     Serial.begin(115200);
@@ -129,142 +132,192 @@ void setup()
 }
 
 /*
- * Determine time between pulses from tachometer
+ * Interrupt function to determine motor velocity using tachometer pulses
  */
-void tachometer()
+void interruptReadTachometer()
 {
-  t_per = micros() - microseconds;
-  microseconds = micros();
+  long currTime = micros();
+  tachPeriodInterrupt = float (currTime - prevTimeInterrupt);
+  prevTimeInterrupt = currTime;
 }
 
-/* switch
-
-   Each time the input pin goes from LOW to HIGH (e.g. because of a push-button
-   press), the corrosponding output pin goes low and the other two go high.
-   Repeated button presses of the same button do nothing. A different button must be pressed to change state.
-   There's a minimum delay between toggles to debounce the circuit (i.e. to ignore
-   noise)
-
-   David A. Mellis with modifications by L. Sherman (2/2019) for interlock mechanism
-   21 November 2006
-*/
-
+/*
+ * Main loop
+ */
 void loop()
 {
+  readInputs();
+
+  handleButtonPresses();
+
+  driveLeds();
+
+  autoOff();
+
+  motorControl();
+    
   debug();
+}
 
-  v_trim_45 = analogRead(TRIMPOT_45);
-  v_trim_33 = analogRead(TRIMPOT_33);
-  v_photo = analogRead(OPTO);
+void readInputs()
+{
+  // read the motor velocity
+  noInterrupts(); // disable interrupts temporarily while reading
+  float tachPeriod = velocityAvg.reading(tachPeriodInterrupt);
+  interrupts(); // turn interrupts back on
 
+  // Compute velocity from tach period
+  // Dividing by 1.0e8 puts the number in a range that is suitable to the PID
+  pidInput = 1/(tachPeriod/1.0e8) * VEL_FACTOR;
+
+  if (APPLY_TRIM) {
+    valueTrim45 = analogRead(TRIMPOT_45);
+    valueTrim33 = analogRead(TRIMPOT_33);
+  }
+  valuePhoto = analogRead(OPTO);
+}
+
+/*
+ * Get amount to add to setPoint depending on trimmer value
+ */
+float getTrimAmount(bool for33 = true)
+{
+  int trimAmount = for33 ? TRIM_AMOUNT_33 : TRIM_AMOUNT_45;
+  int trimmerValue = for33 ? valueTrim33 : valueTrim45;
+  return trimAmount * map(trimmerValue, 1023, 0, -512, 512) / 512;
+}
+
+void handleButtonPresses()
+{
   /*
-   * "OFF" button and LED
+   * "OFF" button
    */
   // if the input just went from LOW and HIGH and we've waited long enough
   // to ignore any noise on the circuit, drive the output pin low and the other two outputs high and remember
   // the time
-  if (playState != off && digitalRead(BTNOFF) == LOW && millis() - timeOFF > debounce) {
+  if (playState != off && digitalRead(BTNOFF) == LOW && millis() - lastTimeOff > DEBOUNCE_MS) {
     playState = off;
-    timeOFF = millis();
+    pidSetpoint = 0;
+    lastTimeOff = millis();
   }
-  digitalWrite(LEDOFF, playState == off ? LOW : HIGH);
 
   /*
-   * "33 RPM" button and LED
+   * "33 RPM" button
    */
-  if (playState != play33 && digitalRead(BTN33) == LOW && millis() - time33 > debounce) {
+  if (playState != play33 && digitalRead(BTN33) == LOW && millis() - lastTime33 > DEBOUNCE_MS) {
+    lastTime33 = millis();
+    if (playState == off) {
+      lastTimePlay = lastTime33;
+    }
+    pidSetpoint = TARGET_VEL_33;
+    pidInput = pidSetpoint * 1.5;
     playState = play33;
-    time33 = millis();
+  } else if (playState == play33 && APPLY_TRIM) {
+    // We didn't press the button, but we do want to apply trim
+    pidSetpoint = TARGET_VEL_33 + getTrimAmount(true);
   }
-  if (playState == play33) {
-    t_set = t_set_33 + v_trim_33 - trim_offset;
-  }
-  digitalWrite(LED33, playState == play33 ? LOW : HIGH);
 
   /*
-   * "45 RPM" button and LED
+   * "45 RPM" button
    */
-  if (playState != play45 && digitalRead(BTN45) == LOW && millis() - time45 > debounce) {
+  if (playState != play45 && digitalRead(BTN45) == LOW && millis() - lastTime45 > DEBOUNCE_MS) {
+    lastTime45 = millis();
+    if (playState == off) {
+      lastTimePlay = lastTime45;
+    }
+    pidSetpoint = TARGET_VEL_45;
+    pidInput = pidSetpoint * 1.5;
     playState = play45;
-    time45 = millis();
+  } else if (playState == play45 && APPLY_TRIM) {
+    // We didn't press the button, but we do want to apply trim
+    pidSetpoint = TARGET_VEL_45 + getTrimAmount(false);
   }
-  if (playState == play45) {
-    t_set = t_set_45 + v_trim_45 - trim_offset;
-  }
-  digitalWrite(LED45, playState == play45 ? LOW : HIGH);
+}
 
+void driveLeds()
+{
+  digitalWrite(LEDOFF, playState == off ? LOW : HIGH);
+  digitalWrite(LED33, playState == play33 ? LOW : HIGH);
+  digitalWrite(LED45, playState == play45 ? LOW : HIGH);
+}
+
+void autoOff()
+{
   /*
-   * Tonearm photo trip
+   * Auto-off logic using tone arm photo trip
    *
    * When the tonearm reaches the record end, the photo resistor is interrupted and the OFF state is set.
    */
-  if (playState != off && v_photo > photo_trip_min) {
-    if (photo_measuring == false && millis() - time_photo_start > 200) {
-      // Start a new measurement every 200 ms
-      time_photo_start = millis();
-      photo_measuring = true;
-      vPhotoAvg.reset();
-    }
-    if (photo_measuring) {
-      // Add a reading up to the count
-      if (vPhotoAvg.getCount() < v_photo_avg_count) {
-        vPhotoAvg.reading(v_photo);
-      } else {
-        // We have sufficient readings, stop measuring
-        photo_measuring = false;
-        // Compare measurement, turn off if over threshold
-        if (vPhotoAvg.getAvg() - previous_v_photo_avg > v_photo_threshold) {
-          playState = off;
-        }
-        previous_v_photo_avg = vPhotoAvg.getAvg();
-      }
-    }
+  if (playState == off || valuePhoto < PHOTO_MIN_VALUE) {
+    // Only apply auto-off logic:
+    // - when the turntable is playing.
+    // - when a minimum amount of light is detected by the optical sensor,
+    //   which indicates that the tone arm is close to the end of the record.
+    return;
   }
-
-  /*
-   * Read period from tachometer
-   */
-  t_per = constrain(t_per, 5000, 50000);
-  t_diff = t_per - t_set;
-  n_PWM = map(t_diff, t_err_range, -t_err_range, 255, 0);
-  n_PWM = n_PWM - n_offset;
-  n_PWM = constrain(n_PWM, 0, 255);
-
-  /*
-   * Control motor
-   *
-   * Hold motor off during off state, else drive with PWM output
-   */
-  analogWrite (PWM_OUT, playState == off ? 0 : n_PWM);
-
+  // Start a new measurement every 200 ms
+  if (photoMeasurementIsActive == false && millis() - timePhotoMeasureStart > 200) {
+    timePhotoMeasureStart = millis();
+    valuePhotoAvg.reset();
+    photoMeasurementIsActive = true;
+  }
+  if (!photoMeasurementIsActive) {
+    return;
+  }
+  // Add a reading up to the amount needed
+  if (valuePhotoAvg.getCount() < PHOTO_MEASUREMENT_COUNT) {
+    valuePhotoAvg.reading(valuePhoto);
+    return;
+  }
+  // We have enough readings to average, check if auto-off threshold was triggered.
+  if (valuePhotoAvg.getAvg() - previousValuePhotoAvg > PHOTO_CHANGE_THRESHOLD) {
+    // Turn off...
+    playState = off;
+  }
+  previousValuePhotoAvg = valuePhotoAvg.getAvg();
+  // Stop measuring, we'll start a new measurement next loop...
+  photoMeasurementIsActive = false;
 }
 
-/*
- * Debug output
- */
+void motorControl()
+{
+  /*
+   * Hold motor off during off state, else drive with PWM output
+   */
+  if (playState == off) {
+    analogWrite(PWM_OUT, 0);
+    return;
+  }
+
+  if (millis() - lastTimePlay < 100) {
+    // Give the motor enough power initially to get going (circumvent PID)
+    analogWrite(PWM_OUT, 250);
+    return;
+  }
+
+  // We don't need much power afterwards to keep the motor going
+  motorPid.SetOutputLimits(50, 150);
+
+  // Get PID value and apply
+  motorPid.Compute();
+  analogWrite(PWM_OUT, pidOutput);
+}
+
 void debug()
 {
-  if (DEBUG) {
-    Serial.print(t_per);
-    Serial.print(" ");
-    Serial.print(t_diff);
-    Serial.print(" ");
-    Serial.print(v_trim_33);
-    Serial.print(" ");
-    Serial.print(v_trim_45);
-    Serial.print (" ");
-    Serial.print (t_set);
-    Serial.print (" ");
-    Serial.print (n_PWM);
-    Serial.print (" ");
-    Serial.print (v_photo);
-    Serial.print (" ");
-    Serial.print (playState);
-    Serial.print (" ");
-    if (vPhotoAvg.getAvg() - previous_v_photo_avg > 0) {
-      Serial.print (vPhotoAvg.getAvg() - previous_v_photo_avg);
-      Serial.print (" ");
-    }
-    Serial.println();
+  /*
+   * Debug output
+   */
+  if (!DEBUG) {
+    return;
   }
+  Serial.print("pidInput:");
+  Serial.print(pidInput);
+  Serial.print(",");
+  Serial.print("pidOutput:");
+  Serial.print(pidOutput * 10);
+  Serial.print(",");
+  Serial.print("pidSetpoint:");
+  Serial.print(pidSetpoint);
+  Serial.println();
 }
