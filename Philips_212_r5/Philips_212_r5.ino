@@ -163,7 +163,7 @@ void readInputs()
 {
   // read the motor velocity
   noInterrupts(); // disable interrupts temporarily while reading
-  float tachPeriod = pidInput = velocityAvg.reading(tachPeriodInterrupt);
+  float tachPeriod = velocityAvg.reading(tachPeriodInterrupt);
   interrupts(); // turn interrupts back on
 
   // Compute velocity from tach period
