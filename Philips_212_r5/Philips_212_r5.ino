@@ -95,8 +95,8 @@ movingAvg velocityAvg(3);
 
 // Use the "volatile" directive for variables
 // used in an interrupt
-volatile float velocityInterrupt = 0;
-volatile long prevTimeInterrupt = 0;
+volatile float tachPeriodInterrupt = 0;
+volatile unsigned long prevTimeInterrupt = 0;
 
 void setup()
 {
@@ -113,7 +113,7 @@ void setup()
   pinMode(PWM_OUT, OUTPUT);
 
   // Set external interrupt for tachometer period measurement
-  attachInterrupt(digitalPinToInterrupt(TACH_IN), tachometer, FALLING);
+  attachInterrupt(digitalPinToInterrupt(TACH_IN), interruptReadTachometer, FALLING);
 
   // Set up PID speed control
   motorPid.SetTunings(pidP, pidI, pidD);
@@ -134,13 +134,10 @@ void setup()
 /*
  * Interrupt function to determine motor velocity using tachometer pulses
  */
-void tachometer()
+void interruptReadTachometer()
 {
-  // Compute velocity
   long currTime = micros();
-  // Dividing by 1.0e8 puts the number in a range that is suitable to the PID
-  float timeDelta = ((float) (currTime - prevTimeInterrupt))/1.0e8;
-  velocityInterrupt = 1/timeDelta * VEL_FACTOR;
+  tachPeriodInterrupt = float (currTime - prevTimeInterrupt);
   prevTimeInterrupt = currTime;
 }
 
@@ -166,8 +163,12 @@ void readInputs()
 {
   // read the motor velocity
   noInterrupts(); // disable interrupts temporarily while reading
-  pidInput = velocityAvg.reading(velocityInterrupt);
+  float tachPeriod = pidInput = velocityAvg.reading(tachPeriodInterrupt);
   interrupts(); // turn interrupts back on
+
+  // Compute velocity from tach period
+  // Dividing by 1.0e8 puts the number in a range that is suitable to the PID
+  pidInput = 1/(tachPeriod/1.0e8) * VEL_FACTOR;
 
   if (APPLY_TRIM) {
     valueTrim45 = analogRead(TRIMPOT_45);
