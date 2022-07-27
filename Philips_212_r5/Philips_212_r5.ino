@@ -15,8 +15,8 @@ const int PHOTO_MIN_VALUE = 800;
  */
 
 // Motor velocity target values for 33RPM and 45RPM
-const float TARGET_VEL_33 = 3333;
-const float TARGET_VEL_45 = 4500;
+const float TARGET_VEL_33 = 33.33 * 100;
+const float TARGET_VEL_45 = 45 * 100;
 // Debug flag
 const bool DEBUG = false;
 // Whether to apply speed trimmer values
@@ -87,13 +87,11 @@ long lastTimePlay = 0;
 long timePhotoMeasureStart = 0;
 
 // PID
-float pidSetpoint = 0;
-float pidInput;
-float pidOutput = 0;
-//const float pidP = 0.12, pidI = 0.6, pidD = 0.00001;
-//const float pidP = 0.27, pidI = 0, pidD = 0;
-const float pidP = 0.135, pidI = 0.8, pidD = 0.00001;
+float pidSetpoint = 0, pidInput, pidOutput = 0;
+const float pidP = 0.135, pidI = 0.6, pidD = 0;
 QuickPID motorPid(&pidInput, &pidOutput, &pidSetpoint);
+// Smooth out velocity readings to avoid judder (some loop cycles there is no new reading from the tachometer)
+movingAvg velocityAvg(3);
 
 // Use the "volatile" directive for variables
 // used in an interrupt
@@ -124,8 +122,9 @@ void setup()
   // Turn PID on
   motorPid.SetMode(motorPid.Control::automatic);
 
-  // Initialise valuePhoto measurement moving average
+  // Initialise moving averages
   valuePhotoAvg.begin();
+  velocityAvg.begin();
 
   if (DEBUG) {
     Serial.begin(115200);
@@ -139,6 +138,7 @@ void tachometer()
 {
   // Compute velocity
   long currTime = micros();
+  // Dividing by 1.0e8 puts the number in a range that is suitable to the PID
   float timeDelta = ((float) (currTime - prevTimeInterrupt))/1.0e8;
   velocityInterrupt = 1/timeDelta * VEL_FACTOR;
   prevTimeInterrupt = currTime;
@@ -166,7 +166,7 @@ void readInputs()
 {
   // read the motor velocity
   noInterrupts(); // disable interrupts temporarily while reading
-  pidInput = velocityInterrupt;
+  pidInput = velocityAvg.reading(velocityInterrupt);
   interrupts(); // turn interrupts back on
 
   if (APPLY_TRIM) {
@@ -287,11 +287,13 @@ void motorControl()
     analogWrite(PWM_OUT, 0);
     return;
   }
+
   if (millis() - lastTimePlay < 100) {
     // Give the motor enough power initially to get going (circumvent PID)
     analogWrite(PWM_OUT, 250);
     return;
   }
+
   // We don't need much power afterwards to keep the motor going
   motorPid.SetOutputLimits(50, 150);
 
