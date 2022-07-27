@@ -6,6 +6,7 @@
  */
 
 // Factor that turns velocity into a number that looks like RPMs. Set by trying values while measuring turntable with a separate tachometer.
+// The higher the value, the slower the motor spins
 const float VEL_FACTOR = 0.846798789;
 // Threshold for end-of-record auto-off photo sensor. This probably doesn't need to be adjusted...
 const int PHOTO_MIN_VALUE = 800;
@@ -88,10 +89,8 @@ long timePhotoMeasureStart = 0;
 
 // PID
 float pidSetpoint = 0, pidInput, pidOutput = 0;
-const float pidP = 0.135, pidI = 0.6, pidD = 0;
+const float pidP = 0.06, pidI = 0.4, pidD = 0.0001;
 QuickPID motorPid(&pidInput, &pidOutput, &pidSetpoint);
-// Smooth out velocity readings to avoid judder (some loop cycles there is no new reading from the tachometer)
-movingAvg velocityAvg(3);
 
 // Use the "volatile" directive for variables
 // used in an interrupt
@@ -119,12 +118,13 @@ void setup()
   motorPid.SetTunings(pidP, pidI, pidD);
   motorPid.SetOutputLimits(0, 255);
   motorPid.SetAntiWindupMode(motorPid.iAwMode::iAwOff);
+  // Roughly 500Hz PWM drive
+  motorPid.SetSampleTimeUs(2000);
   // Turn PID on
   motorPid.SetMode(motorPid.Control::automatic);
 
   // Initialise moving averages
   valuePhotoAvg.begin();
-  velocityAvg.begin();
 
   if (DEBUG) {
     Serial.begin(115200);
@@ -163,7 +163,7 @@ void readInputs()
 {
   // read the motor velocity
   noInterrupts(); // disable interrupts temporarily while reading
-  float tachPeriod = velocityAvg.reading(tachPeriodInterrupt);
+  float tachPeriod = tachPeriodInterrupt;
   interrupts(); // turn interrupts back on
 
   // Compute velocity from tach period
@@ -289,13 +289,13 @@ void motorControl()
     return;
   }
 
-  if (millis() - lastTimePlay < 100) {
+  if (millis() - lastTimePlay < 1000) {
     // Give the motor enough power initially to get going (circumvent PID)
     analogWrite(PWM_OUT, 250);
     return;
   }
 
-  // We don't need much power afterwards to keep the motor going
+  // We don't need much power afterwards to keep the motor going, this is roughly the required range
   motorPid.SetOutputLimits(50, 150);
 
   // Get PID value and apply
